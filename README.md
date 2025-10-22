@@ -14,7 +14,7 @@ Made with [LittleJS](https://github.com/KilledByAPixel/LittleJS)
 ## 🕹️ Controls
 
 - Move: Arrow Keys or WASD
-- Continue (menus, act intro, cutscene): Enter / Space / Click
+- Continue: Enter / Space / Click
 - Restart: R
 - Skip cutscene: Enter / Space / Click
 
