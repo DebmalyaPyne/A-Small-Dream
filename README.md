@@ -54,7 +54,7 @@ Open <http://localhost:8080> in your browser.
 ## 📜 License
 
 - Code: Apache License 2.0 (Apache-2.0) — see `LICENSE`
-- Original game assets (narrative): Creative Commons Attribution 4.0 (CC BY 4.0) — see `ASSETS-LICENSE`
+- Original game assets (art & narrative): Creative Commons Attribution 4.0 (CC BY 4.0) — see `ASSETS-LICENSE`
 - Third‑party:
   - LittleJS — MIT License
   - Fonts (Cinzel Decorative, Cinzel, Nunito, Fira Code) — SIL Open Font License 1.1 (served via Google Fonts)
