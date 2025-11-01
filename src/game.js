@@ -1,83 +1,197 @@
 'use strict';
 
-// --- Visual tone ---
-setShowSplashScreen(false);
-canvasClearColor = rgb(0.04, 0.04, 0.07);
-canvasPixelated = false;
-tilesPixelated = false;
-// Defer audio until user interacts (avoids autoplay warning)
-setSoundEnable(false);
-// Set default UI font
-setFontDefault('Nunito, Arial');
+// ---------- Core Constants (top-level) ----------
+// Game states
+const STATE_MENU = 0, STATE_ACT_INTRO = 1, STATE_PLAY = 2, STATE_LEVEL_COMPLETE = 3, STATE_GAMEOVER = 4, STATE_ENDING = 5;
+const STATE_TUTORIAL = 6; // onboarding dialogue overlay
+const TOTAL_LEVELS = 3;
 
-// Math helpers
-function lerp(a,b,t){ return a + (b-a) * t; }
-function mix(a,b,t){ return lerp(a,b,t); }
-function smoothstep(a,b,x){ const t = clamp((x-a)/(b-a), 0, 1); return t*t*(3-2*t); }
+// Fonts
+const FONT_UI = 'Nunito, sans-serif';
+const FONT_MONO = 'Fira Code, monospace';
+const FONT_CINZEL = 'Cinzel, serif';
 
-// Camera/world units
-cameraPos = vec2(0, 0);
-cameraScale = 28; // smaller -> zoom out
+// Screen-space helper (0..1 -> overlay pixels)
+const scr = (x, y) => {
+  const w = overlayCanvas ? overlayCanvas.width : 1280;
+  const h = overlayCanvas ? overlayCanvas.height : 720;
+  return vec2(w * x, h * y);
+};
 
-// --- Audio ---
-const sfx_collect = new Sound([2,.5,522,.01,.17,.22,3,2.4,0,0,0,0,0,0,0,.2,.01,.51,0,0,.12,.18]); // soft chime
-const sfx_pulse   = new Sound([1,.5,220,.02,.08,.23,1,3,0,0,0,0,0,0,0,.1,.02,.6,0,0,.01,.2]);
-// Grow SFX removed
+// Fast math helpers
+function dist2(a, b){ const dx = a.x - b.x, dy = a.y - b.y; return dx*dx + dy*dy; }
+const COLLECT_RADIUS = 0.85;
+const COLLECT_RADIUS2 = COLLECT_RADIUS * COLLECT_RADIUS;
 
-// --- Game state ---
-let player;
-let memoryOrbs = [];
-// Pushable objects removed
-let ui;
-let dreamTimer;           // seconds
-let dreamTimerStart = 135; // ~2m15s default; adjust later
-let collected = 0;
-let gameOver = false;
-let gameWon = false;
-// Simple state machine for menu/play/gameover
-const STATE_MENU = 'menu';
-const STATE_PLAY = 'play';
-const STATE_GAMEOVER = 'gameover';
-const STATE_LEVEL_COMPLETE = 'level_complete';
-const STATE_ACT_INTRO = 'act_intro';
-const STATE_ENDING = 'ending';
+// Camera base scale
+const CAMERA_BASE_SCALE = 28;
+
+// UI helpers
+function insideButton(pos, size){
+  const mx = mousePosScreen.x, my = mousePosScreen.y;
+  return mx >= pos.x - size.x/2 && mx <= pos.x + size.x/2 && my >= pos.y - size.y/2 && my <= pos.y + size.y/2;
+}
+
+function drawUIButton(label, pos, size, textSize = 26, font = FONT_CINZEL){
+  const hovered = insideButton(pos, size);
+  const bg = hovered ? hsl(0.62, 0.55, 0.35, 0.95) : hsl(0.62, 0.55, 0.28, 0.9);
+  const border = rgb(0.1,0.12,0.16, 0.9);
+  drawRectGradient(pos, size, bg, hsl(0.62,0.55,0.22,0.9), 0, false, true, overlayContext);
+  drawLineList([
+    pos.add(vec2(-size.x/2, -size.y/2)),
+    pos.add(vec2( size.x/2, -size.y/2)),
+    pos.add(vec2( size.x/2,  size.y/2)),
+    pos.add(vec2(-size.x/2,  size.y/2)),
+    pos.add(vec2(-size.x/2, -size.y/2))
+  ], 3, border, true, vec2(), 0, false, true, overlayContext);
+  drawTextScreen(label, pos, textSize, rgb(1,1,1,0.96), 0, BLACK, 'center', font);
+  return hovered;
+}
+
+// Utility shims (only define if engine didn't)
+if (typeof window !== 'undefined'){
+  if (typeof window.clamp !== 'function') window.clamp = (x, a, b)=> Math.max(a, Math.min(b, x));
+  if (typeof window.lerp !== 'function') window.lerp = (a, b, t)=> a + (b - a) * t;
+  if (typeof window.mix !== 'function') window.mix = (a, b, t)=> a + (b - a) * t;
+  if (typeof window.smoothstep !== 'function') window.smoothstep = (edge0, edge1, x)=>{
+    const t = window.clamp((x - edge0) / (edge1 - edge0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+}
+
+// Global game state
 let gameState = STATE_MENU;
 let currentLevel = 1;
-const TOTAL_LEVELS = 3;
-let orbsRequired = 3;
-// After collecting the last orb, wait briefly so the final sentence is readable
+let orbsRequired = 0;
+let player;
+let ui;
+let memoryOrbs = [];
+let collected = 0;
 let pendingLevelComplete = false;
-let levelCompleteTimer = new Timer();
+let levelCompleteTimer; // initialized in resetGame
+let gameOver = false;
+let gameWon = false;
 
-// Ending sequence state
-let endingTimer;           // 17s scripted timeline
-let endingOrbs = [];       // visual orbs orbiting around player during ending
-let endingCameraScaleStart = 28;
+// Timers
+let dreamTimer; // set when entering play
+let dreamTimerStart = 60; // per-level, set in resetGame
+let dreamTimerInitial = 60;
+let dreamTimerCurrentTotal = 60;
+
+// Lightweight visual FX timings (seconds)
+const FX_WHITE_DUR = 0.35;
+const FX_NEG_DUR = 0.45;
+let fxWhitePulse = 0; // countdown timer
+let fxNegPulse = 0;   // countdown timer
+
+// Ending/cutscene state
+let endingTimer;
+let endingOrbs = [];
 let endingAmbientPlayed = false;
 let endingNextChimeT = 0;
 let endingNextAmbientT = 0;
 let endingSustainPlayed = false;
+let endingCameraScaleStart = 28;
 
-function orbsRequiredForLevel(level){
-  // Updated counts: L1:4, L2:6, L3:8
-  if (level === 1) return 4;
-  if (level === 2) return 6;
-  return 8; // level 3
+// Audio SFX stubs (overridden if real sounds are initialized elsewhere)
+let sfx_pulse = { play: () => {} };
+let sfx_collect = { play: () => {} };
+
+// Tutorial state
+let tutorial = { pages: [], index: 0 };
+let tutorialSeen = false;
+let tutorialReturnToMenu = false; // when true, return to menu after closing tutorial
+
+function getTutorialPages(){
+  return [
+    'A small dream flickers in the dark…\nIt remembers your name.',
+    'Move with W A S D or Arrow Keys.\nFollow where the light feels gentle.',
+    'Collect the white dream orbs.\nEach one helps the dream remember.',
+    'Beware the yellow ones.\nThey take time — and unmake your progress.'
+  ];
 }
 
-// Starting index into memoryLines for each level (so sentences can be sequenced across levels)
-function memoryLineOffsetForLevel(level){
-  if (level === 1) return 0;      // 0..3
-  if (level === 2) return 4;      // 4..9
-  return 10;                      // 10..17
+// Level helpers
+function orbsRequiredForLevel(level){ return level === 1 ? 4 : (level === 2 ? 6 : 8); }
+function memoryLineOffsetForLevel(level){ return level === 1 ? 0 : (level === 2 ? 4 : 10); }
+function timeForLevel(level){ return level === 1 ? 45 : (level === 2 ? 75 : 100); }
+
+// --- Visual tone ---
+function spawnLevelContent(level){
+  // Generate maze and build walls
+  const {cols, rows} = mazeSizeForLevel(level);
+  const maze = generateMaze(cols, rows);
+  const geom = buildMazeObjects(maze);
+
+  // Place player at maze center cell
+  const startC = Math.floor(cols/2), startR = Math.floor(rows/2);
+  const startPos = geom.centerOf(startC, startR);
+  if (player) player.pos = startPos.copy ? startPos.copy() : vec2(startPos.x, startPos.y);
+
+  // Grid helpers
+  const cells = maze.cells;
+  const inBounds = (c,r)=> c>=0 && r>=0 && c<cols && r<rows;
+  const dirs = [ [0,-1,0], [1,0,1], [0,1,2], [-1,0,3] ]; // dx,dy,wallIdx
+  const openNeighbors = (c,r)=>{
+    const res = [];
+    for (const [dx,dy,wi] of dirs){
+      const nc=c+dx, nr=r+dy;
+      if (!inBounds(nc,nr)) continue;
+      if (!cells[r][c].w[wi]) res.push([nc,nr]); // wall open
+    }
+    return res;
+  };
+  const degree = (c,r)=> openNeighbors(c,r).length;
+
+  // Candidate cells excluding start and too close radius
+  const allCells = [];
+  for (let r=0;r<rows;r++) for (let c=0;c<cols;c++) if (!(c===startC && r===startR)) allCells.push([c,r]);
+  const farEnough = (c,r)=> geom.centerOf(c,r).distance(startPos) >= ORB_MIN_FROM_PLAYER;
+
+  // Dead-ends preferred; corridors as fallback to guarantee required whites
+  const deadEnds = allCells.filter(([c,r])=> farEnough(c,r) && degree(c,r) <= 1);
+  const corridors = allCells.filter(([c,r])=> farEnough(c,r) && degree(c,r) >= 2);
+  // Shuffle for randomness (independently to preserve preference ordering)
+  for (let i=deadEnds.length-1; i>0; i--){ const j=(Math.random()*(i+1))|0; const t=deadEnds[i]; deadEnds[i]=deadEnds[j]; deadEnds[j]=t; }
+  for (let i=corridors.length-1; i>0; i--){ const j=(Math.random()*(i+1))|0; const t=corridors[i]; corridors[i]=corridors[j]; corridors[j]=t; }
+
+  // Counts
+  const base = memoryLineOffsetForLevel(level);
+  const required = orbsRequiredForLevel(level);
+  const whitesDesired = required + 2;
+  const negDesired = Math.floor(whitesDesired / 2);
+
+  // 1) Ensure at least `required` whites (dead-ends first, then corridors)
+  const whiteCells = [];
+  let usedDead = 0, usedCorr = 0;
+  while (whiteCells.length < required && usedDead < deadEnds.length) whiteCells.push(deadEnds[usedDead++]);
+  while (whiteCells.length < required && usedCorr < corridors.length) whiteCells.push(corridors[usedCorr++]);
+
+  // 2) Place extra whites up to whitesDesired from remaining cells (dead-ends then corridors)
+  while (whiteCells.length < whitesDesired && (usedDead < deadEnds.length || usedCorr < corridors.length)){
+    if (usedDead < deadEnds.length) whiteCells.push(deadEnds[usedDead++]);
+    else if (usedCorr < corridors.length) whiteCells.push(corridors[usedCorr++]);
+    else break;
+  }
+
+  // 3) Build available pool for negatives from remaining cells (prefer dead-ends first)
+  const usedKeys = new Set(whiteCells.map(([c,r])=> `${c},${r}`));
+  const negPool = [];
+  for (let i=usedDead; i<deadEnds.length; i++){ const cr = deadEnds[i]; const k=`${cr[0]},${cr[1]}`; if (!usedKeys.has(k)) negPool.push(cr); }
+  for (let i=usedCorr; i<corridors.length; i++){ const cr = corridors[i]; const k=`${cr[0]},${cr[1]}`; if (!usedKeys.has(k)) negPool.push(cr); }
+  const negCells = negPool.slice(0, Math.min(negDesired, negPool.length));
+
+  // Instantiate
+  for (let i=0; i<whiteCells.length; i++){
+    const [c,r] = whiteCells[i];
+    memoryOrbs.push(new MemoryOrb(geom.centerOf(c,r), base + i));
+  }
+  for (let i=0; i<negCells.length; i++){
+    const [c,r] = negCells[i];
+    new NegativeOrb(geom.centerOf(c,r));
+  }
 }
-
-// Grow/shrink ability removed
-
-// Light pulse overlay
 let vignetteLayer;
-
-// Trail particles
 let trailEmitter;
 let audioArmed = false;
 
@@ -106,18 +220,115 @@ const memoryLines = [
   'The small dream opens its eyes — and becomes real.'
 ];
 
-// Title font (locked)
 const TITLE_FONT = 'Cinzel Decorative, serif';
+
+// Spawn settings
+const SPAWN_BOUNDS = Object.freeze({ xMin:-10, xMax:10, yMin:-10, yMax:10 });
+const ORB_MIN_FROM_PLAYER = 1.6;
+const ORB_MIN_BETWEEN = 1.2;
+const OBSTACLE_BUFFER = 1.0;
+const WALL_THICKNESS = 0.22;
+
+// Maze settings per level (cols x rows)
+function mazeSizeForLevel(level){
+  // Smaller grids for freer movement
+  if (level === 1) return { cols: 7, rows: 7 };
+  if (level === 2) return { cols: 9, rows: 9 };
+  return { cols: 11, rows: 11 };
+}
+
+function generateMaze(cols, rows){
+  // Each cell has walls: [N,E,S,W]
+  const cells = [];
+  for (let r=0; r<rows; r++){
+    const row = [];
+    for (let c=0; c<cols; c++) row.push({ v:false, w:[true,true,true,true] });
+    cells.push(row);
+  }
+  // DFS stack
+  const stack = [];
+  const startC = Math.floor(cols/2), startR = Math.floor(rows/2);
+  cells[startR][startC].v = true;
+  stack.push({c:startC, r:startR});
+  const dirs = [ [0,-1,0,2], [1,0,1,3], [0,1,2,0], [-1,0,3,1] ]; // dx,dy, wallIdx, oppositeIdx
+  while (stack.length){
+    const cur = stack[stack.length-1];
+    const neigh = [];
+    for (const [dx,dy,wi,oi] of dirs){
+      const nc = cur.c+dx, nr = cur.r+dy;
+      if (nc<0||nr<0||nc>=cols||nr>=rows) continue;
+      if (!cells[nr][nc].v) neigh.push({nc,nr,wi,oi});
+    }
+    if (!neigh.length){ stack.pop(); continue; }
+    // Random neighbor
+    const n = neigh[(Math.random()*neigh.length)|0];
+    // Carve wall
+  cells[cur.r][cur.c].w[n.wi] = false;
+  cells[n.nr][n.nc].w[n.oi] = false; // remove opposite wall on neighbor
+    cells[n.nr][n.nc].v = true;
+    stack.push({c:n.nc, r:n.nr});
+  }
+  return { cols, rows, cells };
+}
+
+function buildMazeObjects(maze){
+  const {cols, rows, cells} = maze;
+  // Compute cell size to fit bounds with margin
+  // Use the full world bounds for more generous cell sizes
+  const usableW = (SPAWN_BOUNDS.xMax - SPAWN_BOUNDS.xMin);
+  const usableH = (SPAWN_BOUNDS.yMax - SPAWN_BOUNDS.yMin);
+  const cellSize = Math.min(usableW/cols, usableH/rows);
+  const width = cols*cellSize, height = rows*cellSize;
+  const left = -width/2, top = -height/2;
+  const centers = [];
+  const centerOf = (c,r)=> vec2(left + c*cellSize + cellSize/2, top + r*cellSize + cellSize/2);
+  // Collect centers
+  for (let r=0;r<rows;r++) for (let c=0;c<cols;c++) centers.push(centerOf(c,r));
+  // Internal walls: draw only North and West to avoid duplicates
+  for (let r=0;r<rows;r++){
+    for (let c=0;c<cols;c++){
+      const cc = centerOf(c,r);
+      const w = cells[r][c].w;
+      if (w[0]) new MazeWall(cc.add(vec2(0, -cellSize/2)), vec2(cellSize, WALL_THICKNESS)); // North
+      if (w[3]) new MazeWall(cc.add(vec2(-cellSize/2, 0)), vec2(WALL_THICKNESS, cellSize)); // West
+    }
+  }
+  // Outer borders
+  new MazeWall(vec2(0, top - WALL_THICKNESS/2), vec2(width + WALL_THICKNESS, WALL_THICKNESS)); // top
+  new MazeWall(vec2(0, -top + WALL_THICKNESS/2), vec2(width + WALL_THICKNESS, WALL_THICKNESS)); // bottom
+  new MazeWall(vec2(left - WALL_THICKNESS/2, 0), vec2(WALL_THICKNESS, height + WALL_THICKNESS)); // left
+  new MazeWall(vec2(-left + WALL_THICKNESS/2, 0), vec2(WALL_THICKNESS, height + WALL_THICKNESS)); // right
+  return { cellSize, left, top, width, height, centers, centerOf };
+}
+
+// Time helpers
+function secondsLeft(){
+  if (!dreamTimer) return 0;
+  const p = clamp(dreamTimer.getPercent(), 0, 1);
+  return Math.max(0, Math.ceil(dreamTimerCurrentTotal * (1 - p)));
+}
+function applyTimePenalty(sec){
+  if (!dreamTimer) return;
+  const p = clamp(dreamTimer.getPercent(), 0, 1);
+  const remaining = Math.max(0, dreamTimerCurrentTotal * (1 - p));
+  const newRemaining = Math.max(0, remaining - sec);
+  dreamTimer = new Timer();
+  dreamTimer.set(newRemaining);
+  dreamTimerCurrentTotal = newRemaining;
+  if (newRemaining <= 0) endDream(false);
+}
 
 // Simple object classes
 class Player extends EngineObject {
      constructor(pos) {
-    super(pos, vec2(1.0, 1.0));
+  super(pos, vec2(0.48, 0.48));
           this.color = rgb(1, 1, 1);
           this.additiveColor = rgb(0.3, 0.5, 1, 0.8);
     this.mass = 1; // enable physics/collisions
     this.damping = 0.95;
-    this.setCollision(true, false, false, false); // collide with solid objects, but not solid
+    // Collide with solid objects; allow tile/raycast support if enabled
+    this.setCollision(true, false, true, true);
+  this.renderOrder = 2;
      }
   update() {
     if (gameState !== STATE_PLAY) return;
@@ -125,15 +336,13 @@ class Player extends EngineObject {
     const dir = keyDirection('ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight');
     const wasd = keyDirection('KeyW', 'KeyS', 'KeyA', 'KeyD');
     const input = dir.add(wasd).clampLength(1);
-  const speed = 7;
+  const speed = 7; // movement tuning
     // Set velocity for physics update (per-frame units)
     this.velocity = input.scale(speed * timeDelta);
 
-    // Keep camera near player
+  // Keep camera near player
     cameraPos = cameraPos.lerp(this.pos, 0.08);
-
-    // Grow ability removed
-
+    
     // Run physics/collisions
     super.update();
 
@@ -147,9 +356,11 @@ class Player extends EngineObject {
     if (rand() < 0.003) sfx_pulse.play(this.pos, 0.15, 1 + rand(-.02, .02));
   }
   render() {
-    // base glow
-    drawCircle(this.pos, 0.28, hsl(0.58, 0.8, 0.8, 0.5));
-    drawCircle(this.pos, 0.12, rgb(1,1,1,0.9));
+    // base glow scaled to collider size to fit corridors
+    const outer = this.size.x * 0.55;
+    const inner = this.size.x * 0.23;
+    drawCircle(this.pos, outer, hsl(0.58, 0.8, 0.8, 0.5));
+    drawCircle(this.pos, inner, rgb(1,1,1,0.9));
   }
 }
 
@@ -159,17 +370,22 @@ class MemoryOrb extends EngineObject {
     // lineIndex is ignored; lines are shown based on collection order
     this.lineIndex = lineIndex;
     this.pulse = rand(.7, 1.1);
+    this.renderOrder = 1;
   }
   update() {
     if (gameState !== STATE_PLAY) return;
+    // If level completion is pending, suspend further collections
+    if (pendingLevelComplete) return;
     // gentle hover
     this.pos.y += Math.sin(time * 2 + this.pulse) * 0.003;
     // faint audio ping sometimes
     if (rand() < 0.002) sfx_pulse.play(this.pos, 0.12, 1.5);
 
-    // collect
-    if (this.pos.distance(player.pos) < 0.85) {
+  // collect (squared distance check)
+  if (dist2(this.pos, player.pos) < COLLECT_RADIUS2) {
       sfx_collect.play(this.pos, 0.5);
+      // trigger subtle white pulse effect
+      fxWhitePulse = FX_WHITE_DUR;
       this.destroy();
       const isFinalAct = currentLevel >= TOTAL_LEVELS;
       const willBeLastOrb = (collected + 1) >= orbsRequired;
@@ -193,29 +409,62 @@ class MemoryOrb extends EngineObject {
     }
   }
   render() {
-    const r = 0.30 + 0.035 * Math.sin(time * 6 + this.pulse);
-    drawCircle(this.pos, r * 3.4, rgb(0.4, 0.7, 1, 0.07));
-    drawCircle(this.pos, r * 2.0, rgb(0.4, 0.7, 1, 0.12));
-    drawCircle(this.pos, r, rgb(0.9, 0.97, 1, 0.9));
+    const r = 0.32 + 0.040 * Math.sin(time * 6 + this.pulse);
+    drawCircle(this.pos, r * 3.8, rgb(0.4, 0.7, 1, 0.10));
+    drawCircle(this.pos, r * 2.2, rgb(0.4, 0.7, 1, 0.16));
+    drawCircle(this.pos, r, rgb(0.95, 0.99, 1, 0.92));
   }
 }
 
-// Pushable class removed
+// Negative Dream Orb: looks similar, yellow; on collect: -1 collected and -5s time
+class NegativeOrb extends EngineObject {
+  constructor(pos) {
+    super(pos, vec2(1.0, 1.0));
+    this.pulse = rand(.7, 1.1);
+    this.renderOrder = 1;
+  }
+  update(){
+    if (gameState !== STATE_PLAY) return;
+    // gentle hover
+    this.pos.y += Math.sin(time * 2 + this.pulse) * 0.003;
+    // subtle ominous ping sometimes
+    if (rand() < 0.002) sfx_pulse.play(this.pos, 0.12, 0.7);
 
-// Static obstacle (solid)
-class Obstacle extends EngineObject {
-  constructor(pos, size=vec2(2,2)){
-    super(pos, size);
-    this.mass = 0; // static ground-like
-    this.setCollision(true, true, false, false); // solid
-    this.color = rgb(0.25, 0.35, 0.6, 0.2);
+  // collect penalty
+  if (dist2(this.pos, player.pos) < COLLECT_RADIUS2){
+      sfx_pulse.play(this.pos, 0.5, 0.6);
+      fxNegPulse = FX_NEG_DUR;
+      this.destroy();
+      collected = Math.max(0, collected - 1);
+      pendingLevelComplete = false;
+      levelCompleteTimer = new Timer();
+      applyTimePenalty(5);
+    }
   }
   render(){
-    // draw a soft glowing orb-like obstacle
-    const r = Math.max(this.size.x, this.size.y) * 0.45;
-    drawCircle(this.pos, r*2.0, rgb(0.35,0.55,0.9,0.06));
-    drawCircle(this.pos, r*1.3, rgb(0.45,0.65,1,0.10));
-    drawCircle(this.pos, r*0.9, rgb(0.85,0.95,1,0.25));
+    const r = 0.32 + 0.040 * Math.sin(time * 6 + this.pulse);
+    drawCircle(this.pos, r * 3.8, rgb(1.0, 0.88, 0.2, 0.10));
+    drawCircle(this.pos, r * 2.2, rgb(1.0, 0.85, 0.15, 0.16));
+    drawCircle(this.pos, r,       rgb(1.0, 0.96, 0.6, 0.92));
+  }
+}
+
+//
+
+// Maze wall (static, solid)
+class MazeWall extends EngineObject {
+  constructor(pos, size){
+    super(pos, size);
+    this.mass = 0;
+    // Solid wall; enable full collision flags for robustness
+    this.setCollision(true, true, true, true);
+    this.color = rgb(0.2, 0.3, 0.5, 0.5);
+    this.renderOrder = 0;
+  }
+  render(){
+    // Soft rectangular wall with a glow edge (brighter for visibility)
+    drawRect(this.pos, this.size, rgb(0.16,0.24,0.42,0.95));
+    drawRect(this.pos, this.size.scale(1.10), rgb(0.35,0.55,0.9,0.20));
   }
 }
 
@@ -235,26 +484,24 @@ class UIOverlay {
     this.textTimer.set(3.5);
   }
   render(){
-    const scr = (x, y) => {
-      const w = (typeof overlayCanvas !== 'undefined' && overlayCanvas) ? overlayCanvas.width : 1280;
-      const h = (typeof overlayCanvas !== 'undefined' && overlayCanvas) ? overlayCanvas.height : 720;
-      return vec2(w * x, h * y);
-    };
-    // Dream fade vignette
-    const fade = clamp(1 - dreamTimer.getPercent(), 0, 1);
+    // Dream fade vignette — normalized against initial level time so penalties darken appropriately
+    const pTimer = clamp(dreamTimer.getPercent(), 0, 1);
+    const secsLeft = Math.max(0, dreamTimerCurrentTotal * (1 - pTimer));
+    const pRemaining = dreamTimerInitial > 0 ? secsLeft / dreamTimerInitial : 0;
+    const fade = clamp(pRemaining, 0, 1);
     const darkness = 0.25 + 0.5 * (1 - fade);
     const camSize = getCameraSize();
     drawRect(cameraPos, camSize, rgb(0,0,0,darkness));
 
     // Timer text
-    const p = clamp(dreamTimer.getPercent(), 0, 1);
-    const secondsLeft = Math.max(0, Math.ceil(dreamTimerStart * (1 - p)));
+  const p = clamp(dreamTimer.getPercent(), 0, 1);
+  const secondsLeft = Math.max(0, Math.ceil(dreamTimerCurrentTotal * (1 - p)));
   drawTextScreen(`${secondsLeft}s`, scr(0.96, 0.06), 18, rgb(0.8,0.85,1,0.7));
 
     // Memory text
     if (this.textTimer.active()) {
       const p = 1 - this.textTimer.getPercent();
-  drawTextScreen(this.text, scr(0.5, 0.9), 24, rgb(0.9,0.95,1,0.9), 0, BLACK, 'center', 'Fira Code, monospace');
+          drawTextScreen(this.text, scr(0.5, 0.9), 24, rgb(0.9,0.95,1,0.9), 0, BLACK, 'center', FONT_MONO);
     }
 
   // Progress dots (dynamic per level)
@@ -265,7 +512,13 @@ class UIOverlay {
     if (gameOver){
       const msg = gameWon ? 'the dream dissolves into light' : 'the dream fades to dark';
       drawRect(cameraPos, getCameraSize(), rgb(0,0,0,0.3));
-  drawTextScreen(msg, scr(0.5, 0.5), 32, rgb(1,1,1,0.95));
+  if (gameWon) {
+    // Keep win message using the default UI font
+    drawTextScreen(msg, scr(0.5, 0.5), 32, rgb(1,1,1,0.95));
+  } else {
+    // Use Cinzel specifically for the lose message
+          drawTextScreen(msg, scr(0.5, 0.5), 32, rgb(1,1,1,0.95), 0, BLACK, 'center', FONT_CINZEL);
+  }
   drawTextScreen('Press R to restart', scr(0.5, 0.57), 20, rgb(1,1,1,0.7));
     }
   }
@@ -291,10 +544,12 @@ function onLevelComplete(){
 function resetGame(level = currentLevel){
   currentLevel = level;
   orbsRequired = orbsRequiredForLevel(level);
+  // Set per-level time budget
+  dreamTimerStart = timeForLevel(level);
   // Destroy existing objects
   engineObjectsDestroy();
   memoryOrbs = [];
-  // pushables removed
+  
   collected = 0;
   gameOver = false;
   gameWon = false;
@@ -303,7 +558,7 @@ function resetGame(level = currentLevel){
   levelCompleteTimer = new Timer();
   gameState = STATE_ACT_INTRO;
   // Reset camera scale
-  cameraScale = 28;
+  cameraScale = CAMERA_BASE_SCALE;
   // Clear ending state
   endingTimer = undefined; endingOrbs = []; endingAmbientPlayed = false; endingNextChimeT = 0; endingNextAmbientT = 0; endingSustainPlayed = false;
   // No explicit global time reset needed
@@ -314,33 +569,33 @@ function resetGame(level = currentLevel){
 
   // Trail emitter
   trailEmitter = new ParticleEmitter(
-    player.pos,               // position
-    0,                        // angle
-    0,                        // emitSize (radius)
-    0,                        // emitTime (0 = continuous)
-    25,                       // emitRate (particles/sec)
-    PI,                       // emitConeAngle
-    undefined,                // tileInfo (none)
-    rgb(0.7, 0.9, 1, .15),    // colorStartA
-    rgb(0.5, 0.8, 1, .12),    // colorStartB
-    rgb(0.4, 0.7, 1, 0),      // colorEndA
-    rgb(0.4, 0.7, 1, 0),      // colorEndB
-    0.35,                     // particleTime (seconds)
-    0.04,                     // sizeStart
-    0.18,                     // sizeEnd
-    0.0,                      // speed
-    0.0,                      // angleSpeed
-    0.99,                     // damping
-    1.0,                      // angleDamping
-    0,                        // gravityScale
-    PI,                       // particleConeAngle
-    0.05,                     // fadeRate
-    0.5,                      // randomness
-    false,                    // collideTiles
-    true,                     // additive
-    true,                     // randomColorLinear
-    undefined,                // renderOrder (use default based on additive)
-    false                     // localSpace
+    player.pos,
+    0,
+    0,
+    0,
+    25,
+    PI,
+    undefined,
+    rgb(0.7, 0.9, 1, .15),
+    rgb(0.5, 0.8, 1, .12),
+    rgb(0.4, 0.7, 1, 0),
+    rgb(0.4, 0.7, 1, 0),
+    0.35,
+    0.04,
+    0.18,
+    0.0,
+    0.0,
+    0.99,
+    1.0,
+    0,
+    PI,
+    0.05,
+    0.5,
+    false,
+    true,
+    true,
+    undefined,
+    false
   );
   trailEmitter.trailScale = 3;
 }
@@ -349,6 +604,13 @@ function startGame(){
   ui = new UIOverlay();
   currentLevel = 1;
   resetGame(currentLevel);
+  // If first time and on Act 1, show tutorial overlay before act intro
+  try { tutorialSeen = !!(localStorage && localStorage.getItem('asd_tutorial_seen')); } catch {}
+  if (currentLevel === 1 && !tutorialSeen){
+    tutorial.pages = getTutorialPages();
+    tutorial.index = 0;
+    gameState = STATE_TUTORIAL;
+  }
 }
 
 function restartLevel(){
@@ -385,13 +647,145 @@ function setupEnding(){
   endingCameraScaleStart = cameraScale;
 }
 
-// Game callbacks
 function gameInit(){
   // Start in menu; wait for user to press Start or hit Enter/Space
   gameState = STATE_MENU;
 }
 
+// --------- Ending Visuals & Timeline ---------
+function drawEndingSequence(){
+  if (!endingTimer) return;
+  const total = 22.0;
+  const t = clamp(endingTimer.getPercent(), 0, 1) * total;
+  const camSize = getCameraSize();
+  const whiteFade = smoothstep(3.0, 6.0, t);
+  const whiteAlpha = clamp(whiteFade, 0, 1);
+  const zoom = mix(endingCameraScaleStart, endingCameraScaleStart * 1.6, smoothstep(3.0, 6.0, t));
+  cameraScale = zoom;
+  if (player) cameraPos = player.pos;
+
+  const bloom = smoothstep(3.0, 6.0, t);
+  const glowR1 = 0.28 + 1.2 * bloom;
+  const glowR2 = 0.12 + 0.9 * bloom;
+  drawCircle(player.pos, glowR1, rgb(1,1,1,0.22 + 0.35 * bloom));
+  drawCircle(player.pos, glowR2, rgb(1,1,1,0.85 + 0.1 * bloom));
+
+  const orbRise = smoothstep(0.0, 3.0, t);
+  const dissolve = smoothstep(3.0, 6.0, t);
+  const orbitCenter = player.pos;
+  const count = endingOrbs.length;
+  for (let i=0; i<count; i++){
+    const o = endingOrbs[i];
+    const speed = mix(0.6, 1.2, orbRise);
+    o.angle += speed * timeDelta;
+    let r = mix(0.7, 1.1, orbRise) + i * 0.02;
+    r *= 1 + 0.03 * Math.sin(time*0.7 + i*0.6) * (0.3 + 0.7*bloom);
+    const pos = orbitCenter.add(vec2(Math.cos(o.angle), Math.sin(o.angle)).scale(r));
+    const a = (1 - dissolve) * 0.9;
+    drawCircle(pos, 0.25, rgb(0.9,0.97,1, a));
+    drawCircle(pos, 0.5, rgb(0.5,0.8,1, 0.12 * a));
+  }
+
+  if (audioArmed){
+    if (t < 3.0 && time > endingNextChimeT){
+      endingNextChimeT = time + 0.4 + rand(-0.08, 0.08);
+      sfx_collect.play(player.pos, 0.2, 1 + rand(-0.05, 0.05));
+    }
+    if (t < 6.0 && time > endingNextAmbientT){
+      endingNextAmbientT = time + 0.8 + rand(-0.1, 0.1);
+      const vol = lerp(0.05, 0.18, smoothstep(0.0, 6.0, t));
+      sfx_pulse.play(player.pos, vol, 0.5 + 0.5 * smoothstep(0.0, 6.0, t));
+    }
+    if (t >= 8.0 && !endingSustainPlayed){
+      endingSustainPlayed = true;
+      for (let i=0;i<4;i++) setTimeout(()=> sfx_pulse.play(player.pos, 0.15, 0.8), 120*i);
+    }
+  }
+
+  drawRect(cameraPos, camSize, rgb(1,1,1, whiteAlpha * 0.95));
+
+  const lines = ['The small dream…','opens its eyes…','and becomes real.'];
+  const schedule = [6.0, 6.7, 7.4];
+  for (let i=0; i<lines.length; i++){
+    const start = schedule[i];
+    const end = start + 3.0;
+    if (t >= start - 0.2 && t <= end + 0.5){
+      const p = clamp((t - start) / 3.0, 0, 1);
+      const alpha = p < 0.5 ? smoothstep(0.0, 0.5, p) : (1 - smoothstep(0.5, 1.0, p));
+      const y = 0.44 + i*0.08;
+      const b = whiteAlpha;
+      const darkAmt = clamp(b, 0, 1), lightAmt = 1 - darkAmt;
+      if (darkAmt > 0.01)
+        drawTextScreen(lines[i], scr(0.5, y), 30, rgb(0.05,0.06,0.08, alpha * darkAmt * 0.95), 2, rgb(0,0,0, alpha * darkAmt * 0.25), 'center', FONT_CINZEL);
+      if (lightAmt > 0.01)
+        drawTextScreen(lines[i], scr(0.5, y), 30, rgb(1,1,1, alpha * lightAmt * 0.98), 0, BLACK, 'center', FONT_CINZEL);
+    }
+  }
+
+  if (t >= 8.0 && t < 10.0) drawRect(cameraPos, camSize, rgb(1,1,1, 1.0));
+  if (t >= 10.0 && t < 12.0){ const a = smoothstep(10.0, 12.0, t); drawRect(cameraPos, camSize, rgb(0,0,0, a)); }
+  if (t >= 12.0){
+    drawRect(cameraPos, camSize, rgb(0,0,0,1));
+    const p = clamp((t - 12.0) / 1.5, 0, 1);
+    const fadeOut = smoothstep(16.0, 17.0, t);
+    const a = smoothstep(0, 1, p) * (1 - fadeOut);
+    if (a > 0){
+      const pos = scr(0.5, 0.5);
+      drawTextScreen('“And even the smallest spark remembers.”', pos, 24, rgb(0.98,0.99,1, a), 0, BLACK, 'center', FONT_CINZEL);
+    }
+  }
+
+  if (t >= 17.0){
+    drawRect(cameraPos, camSize, rgb(0,0,0,1));
+    const fadeIn = smoothstep(17.0, 18.0, t);
+    const titlePos = scr(0.5, 0.46);
+    const byPos    = scr(0.5, 0.56);
+    const tpShadow = vec2(titlePos.x, titlePos.y + 2);
+    drawTextScreen('A Small Dream', tpShadow, 42, rgb(0,0,0, fadeIn * 0.22), 0, BLACK, 'center', TITLE_FONT);
+    drawTextScreen('A Small Dream', titlePos, 42, rgb(1,1,1, fadeIn * 0.96), 0, BLACK, 'center', TITLE_FONT);
+    const byAlpha = clamp(fadeIn - 0.15, 0, 1);
+    drawTextScreen('by Debmalya Pyne', byPos, 22, rgb(1,1,1, byAlpha * 0.92), 0, BLACK, 'center', FONT_CINZEL);
+  }
+
+  if (endingTimer.elapsed()){ cameraScale = CAMERA_BASE_SCALE; gameState = STATE_MENU; }
+}
+
 function gameUpdate(){
+  // Toggle physics debug draw
+  if (keyWasPressed('KeyP')) try { debugPhysics = !debugPhysics; } catch {}
+  // Tutorial flow
+  if (gameState === STATE_TUTORIAL){
+    const advance = keyWasPressed('Enter') || keyWasPressed('Space') || mouseWasPressed(0);
+    const skip = keyWasPressed('Escape');
+    if (advance){
+      if (tutorial.index < tutorial.pages.length - 1){
+        tutorial.index++;
+      } else {
+        // Mark seen and continue to Act Intro
+        try { if (localStorage) localStorage.setItem('asd_tutorial_seen', '1'); } catch {}
+        tutorialSeen = true;
+        if (tutorialReturnToMenu){
+          tutorialReturnToMenu = false;
+          gameState = STATE_MENU;
+        } else {
+          gameState = STATE_ACT_INTRO;
+          levelCompleteTimer = new Timer(); // ensure fade timer exists
+        }
+      }
+    } else if (skip){
+      try { if (localStorage) localStorage.setItem('asd_tutorial_seen', '1'); } catch {}
+      tutorialSeen = true;
+      if (tutorialReturnToMenu){
+        tutorialReturnToMenu = false;
+        gameState = STATE_MENU;
+      } else {
+        gameState = STATE_ACT_INTRO;
+        levelCompleteTimer = new Timer();
+      }
+    }
+    // No gameplay while tutorial is open
+    return;
+  }
   // Act Intro transition
   if (gameState === STATE_ACT_INTRO){
     // Allow skipping with Enter/Space/Click, or auto-advance after short delay
@@ -400,6 +794,8 @@ function gameUpdate(){
     if (advance){
       dreamTimer = new Timer();
       dreamTimer.set(dreamTimerStart);
+      dreamTimerInitial = dreamTimerStart;
+      dreamTimerCurrentTotal = dreamTimerStart;
       gameState = STATE_PLAY;
     }
     return;
@@ -418,7 +814,7 @@ function gameUpdate(){
   if (gameState === STATE_ENDING){
     if (keyWasPressed('Enter') || keyWasPressed('Space') || mouseWasPressed(0)) {
       // End immediately
-      cameraScale = 28;
+  cameraScale = CAMERA_BASE_SCALE;
       gameState = STATE_MENU;
       return;
     }
@@ -432,8 +828,27 @@ function gameUpdate(){
   }
   // Title/menu input
   if (gameState === STATE_MENU){
-    // Keyboard start
-    if (keyWasPressed('Enter') || keyWasPressed('Space') || mouseWasPressed(0)) startGame();
+    // Keyboard: Start or open tutorial
+    if (keyWasPressed('Enter') || keyWasPressed('Space')) startGame();
+    if (keyWasPressed('KeyH')){
+      tutorial.pages = getTutorialPages();
+      tutorial.index = 0;
+      tutorialReturnToMenu = true;
+      gameState = STATE_TUTORIAL;
+    }
+    // Mouse: handle button clicks here (before inputs are cleared)
+    if (mouseWasPressed(0)){
+      const btnSize = vec2(280, 64);
+      const startPos = scr(0.5, 0.60);
+      const helpPos  = scr(0.5, 0.78);
+      if (insideButton(startPos, btnSize)) startGame();
+      else if (insideButton(helpPos, btnSize)){
+        tutorial.pages = getTutorialPages();
+        tutorial.index = 0;
+        tutorialReturnToMenu = true;
+        gameState = STATE_TUTORIAL;
+      }
+    }
     // Button-specific hover/click also supported in drawTitleScreen
     return;
   }
@@ -494,22 +909,17 @@ function gameRenderPost(){
     drawLevelCompleteScreen();
   } else if (gameState === STATE_ACT_INTRO){
     drawActIntroScreen();
+  } else if (gameState === STATE_TUTORIAL){
+    drawTutorialScreen();
   } else if (gameState === STATE_ENDING){
     drawEndingSequence();
   }
 }
 
-// Start engine
 engineInit(gameInit, gameUpdate, gameUpdatePost, gameRender, gameRenderPost);
 
 // ---------- Title Screen ----------
 function drawTitleScreen(){
-  // Overlay coordinates helper
-  const scr = (x, y) => {
-    const w = overlayCanvas ? overlayCanvas.width : 1280;
-    const h = overlayCanvas ? overlayCanvas.height : 720;
-    return vec2(w * x, h * y);
-  };
 
   // Title text with subtle outline/shadow
   const titlePos = scr(0.5, 0.32);
@@ -518,7 +928,7 @@ function drawTitleScreen(){
   drawTextScreen('A Small Dream', titlePos, titleSize, rgb(0,0,0,0.85), 4, rgb(0,0,0,0.85), 'center', TITLE_FONT);
   // Fill pass
   drawTextScreen('A Small Dream', titlePos, titleSize, rgb(1,1,1,0.97), 0, BLACK, 'center', TITLE_FONT);
-  drawTextScreen('A tiny spark inside a fading dream', scr(0.5, 0.38), 18, rgb(0.9,0.95,1,0.75), 0, BLACK, 'center', 'Cinzel, serif');
+          drawTextScreen('A tiny spark inside a fading dream', scr(0.5, 0.38), 18, rgb(0.9,0.95,1,0.75), 0, BLACK, 'center', FONT_CINZEL);
 
   // Player-like ball bobbing under the title (world-space drawing)
   const bob = 0.12 * Math.sin(time*2.2);
@@ -526,50 +936,22 @@ function drawTitleScreen(){
   drawCircle(ballPos, 0.28, hsl(0.58, 0.8, 0.8, 0.5));
   drawCircle(ballPos, 0.12, rgb(1,1,1,0.9));
 
-  // Start button (overlay)
-  const btnPos = scr(0.5, 0.62);
+  // Buttons (overlay)
+  const startPos = scr(0.5, 0.60);
+  const helpPos  = scr(0.5, 0.78);
   const btnSize = vec2(280, 64);
+  const startHovered = drawUIButton('Start', startPos, btnSize, 26, FONT_CINZEL);
+  const helpHovered  = drawUIButton('How to Play', helpPos, btnSize, 26, FONT_CINZEL);
 
-  const mx = mousePosScreen.x, my = mousePosScreen.y;
-  const hovered = mx >= btnPos.x - btnSize.x/2 && mx <= btnPos.x + btnSize.x/2 &&
-                  my >= btnPos.y - btnSize.y/2 && my <= btnPos.y + btnSize.y/2;
-
-  const bg = hovered ? hsl(0.62, 0.55, 0.35, 0.95) : hsl(0.62, 0.55, 0.28, 0.9);
-  const border = rgb(0.1,0.12,0.16, 0.9);
-  // Button background (overlay pixel coordinates)
-  drawRectGradient(btnPos, btnSize, bg, hsl(0.62,0.55,0.22,0.9), 0, false, true, overlayContext);
-  drawLineList([
-      btnPos.add(vec2(-btnSize.x/2, -btnSize.y/2)),
-      btnPos.add(vec2( btnSize.x/2, -btnSize.y/2)),
-      btnPos.add(vec2( btnSize.x/2,  btnSize.y/2)),
-      btnPos.add(vec2(-btnSize.x/2,  btnSize.y/2)),
-      btnPos.add(vec2(-btnSize.x/2, -btnSize.y/2))
-    ],
-    3,
-    border,
-    true,
-    vec2(),
-    0,
-    false,
-    true,
-    overlayContext
-  );
-  drawTextScreen('Start', btnPos, 26, rgb(1,1,1,0.96), 0, BLACK, 'center', 'Cinzel, serif');
-
-  // Hint
-  drawTextScreen('Press Enter or Space', scr(0.5, 0.72), 16, rgb(0.86,0.9,1,0.85), 0, BLACK, 'center', 'Nunito, Arial');
-
-  // Click to start
-  if (hovered && mouseWasPressed(0)) startGame();
+  // Hints
+  drawTextScreen('Press Enter or Space', startPos.add(vec2(0, 48)), 16, rgb(0.86,0.9,1,0.85), 0, BLACK, 'center', FONT_UI);
+  drawTextScreen('Press H', helpPos.add(vec2(0, 48)), 14, rgb(0.86,0.9,1,0.75), 0, BLACK, 'center', FONT_UI);
+  // Click handling occurs in gameUpdate() for reliable timing
 }
 
 // ---------- Level Complete Screen ----------
 function drawLevelCompleteScreen(){
-  const scr = (x, y) => {
-    const w = overlayCanvas ? overlayCanvas.width : 1280;
-    const h = overlayCanvas ? overlayCanvas.height : 720;
-    return vec2(w * x, h * y);
-  };
+  
 
   // Dim background
   drawRect(cameraPos, getCameraSize(), rgb(0,0,0,0.35));
@@ -583,22 +965,7 @@ function drawLevelCompleteScreen(){
   const restartPos = scr(0.5 - 0.18, 0.55);
   const nextPos = scr(0.5 + 0.18, 0.55);
 
-  const drawButton = (label, pos) => {
-    const mx = mousePosScreen.x, my = mousePosScreen.y;
-    const hovered = mx >= pos.x - btnSize.x/2 && mx <= pos.x + btnSize.x/2 && my >= pos.y - btnSize.y/2 && my <= pos.y + btnSize.y/2;
-    const bg = hovered ? hsl(0.62, 0.55, 0.35, 0.95) : hsl(0.62, 0.55, 0.28, 0.9);
-    const border = rgb(0.1,0.12,0.16, 0.9);
-    drawRectGradient(pos, btnSize, bg, hsl(0.62,0.55,0.22,0.9), 0, false, true, overlayContext);
-    drawLineList([
-      pos.add(vec2(-btnSize.x/2, -btnSize.y/2)),
-      pos.add(vec2( btnSize.x/2, -btnSize.y/2)),
-      pos.add(vec2( btnSize.x/2,  btnSize.y/2)),
-      pos.add(vec2(-btnSize.x/2,  btnSize.y/2)),
-      pos.add(vec2(-btnSize.x/2, -btnSize.y/2))
-    ], 3, border, true, vec2(), 0, false, true, overlayContext);
-    drawTextScreen(label, pos, 24, rgb(1,1,1,0.96), 0, BLACK, 'center', 'Cinzel, serif');
-    return hovered && mouseWasPressed(0);
-  };
+  const drawButton = (label, pos) => drawUIButton(label, pos, btnSize, 24, FONT_CINZEL) && mouseWasPressed(0);
 
   const nextLabel = currentLevel < TOTAL_LEVELS ? 'Next Act' : 'Menu';
   if (drawButton('Restart', restartPos)) restartLevel();
@@ -606,7 +973,7 @@ function drawLevelCompleteScreen(){
 
   // Hints under buttons (match title hint style)
   const hintColor = rgb(0.86,0.9,1,0.85);
-  const hintFont = 'Nunito, Arial';
+  const hintFont = FONT_UI;
   drawTextScreen('Press R', restartPos.add(vec2(0, 48)), 16, hintColor, 0, BLACK, 'center', hintFont);
   drawTextScreen('Press Enter or Space', nextPos.add(vec2(0, 48)), 16, hintColor, 0, BLACK, 'center', hintFont);
 
@@ -621,11 +988,6 @@ function actNameFor(level){
 }
 
 function drawActIntroScreen(){
-  const scr = (x, y) => {
-    const w = overlayCanvas ? overlayCanvas.width : 1280;
-    const h = overlayCanvas ? overlayCanvas.height : 720;
-    return vec2(w * x, h * y);
-  };
 
   // Dim background
   drawRect(cameraPos, getCameraSize(), rgb(0,0,0,0.55));
@@ -641,270 +1003,42 @@ function drawActIntroScreen(){
   const headerColor = rgb(1,1,1,0.95 * alpha);
   const subColor = rgb(0.95,0.98,1,0.92 * alpha);
 
-  drawTextScreen(actLine, scr(0.5, 0.44), 34, headerColor, 3, rgb(0,0,0,0.75*alpha), 'center', 'Cinzel, serif');
+  drawTextScreen(actLine, scr(0.5, 0.44), 34, headerColor, 3, rgb(0,0,0,0.75*alpha), 'center', FONT_CINZEL);
   drawTextScreen(titleLine, scr(0.5, 0.52), 28, subColor, 0, BLACK, 'center', 'Cinzel Decorative, serif');
 
   // Hint
-  drawTextScreen('Press Enter or Click to continue', scr(0.5, 0.66), 14, rgb(0.86,0.9,1,0.75*alpha), 0, BLACK, 'center', 'Nunito, Arial');
+  drawTextScreen('Press Enter or Click to continue', scr(0.5, 0.66), 14, rgb(0.86,0.9,1,0.75*alpha), 0, BLACK, 'center', FONT_UI);
 }
 
-// ---------- Per-Level Content ----------
-function spawnLevelContent(level){
-  // Helper to choose safe random positions
-  const spawnBounds = { xMin:-5, xMax:5, yMin:-5, yMax:5 };
-  const minFromPlayer = 1.6;
-  const minBetweenOrbs = 1.2;
-  const obstacleBuffer = 1.0; // extra distance beyond obstacle radius
-  const orbPositions = [];
-  const isSafe = (p, obstacles)=>{
-    // away from player
-    if (p.distance(vec2(0,0)) < minFromPlayer) return false;
-    // away from obstacles
-    for (const o of obstacles){
-      const rad = Math.max(o.size.x, o.size.y) * 0.5; // conservative radius
-      if (p.distance(o.pos) < rad + obstacleBuffer) return false;
-    }
-    // away from other orbs
-    for (const op of orbPositions){
-      if (p.distance(op) < minBetweenOrbs) return false;
-    }
-    return true;
-  };
-  const randomPos = ()=> vec2(rand(spawnBounds.xMin, spawnBounds.xMax), rand(spawnBounds.yMin, spawnBounds.yMax));
+// ---------- Tutorial Overlay ----------
+function drawTutorialScreen(){
+  // Dim background
+  drawRect(cameraPos, getCameraSize(), rgb(0,0,0,0.55));
 
-  // Level-specific obstacles (kept similar to previous layout)
-  let obstaclesInfo = [];
-  if (level === 1){
-    obstaclesInfo = [
-      {pos:vec2(-2.5, -2.0), size:vec2(2.2,2.2)},
-      {pos:vec2( 2.8,  1.8), size:vec2(2.0,2.0)},
-      {pos:vec2( 0.0, -3.2), size:vec2(2.6,2.6)},
-    ];
-  }
-  else if (level === 2){
-    obstaclesInfo = [
-      {pos:vec2(-3.0, 2.2), size:vec2(2.4,2.4)},
-      {pos:vec2( 3.2, 0.0), size:vec2(2.2,2.2)},
-      {pos:vec2( 0.0,-3.6), size:vec2(2.8,2.8)},
-    ];
-  }
-  else if (level === 3){
-    obstaclesInfo = [
-      {pos:vec2(-3.4,-2.6), size:vec2(2.8,2.8)},
-      {pos:vec2( 3.6,-0.8), size:vec2(2.6,2.6)},
-      {pos:vec2( 0.0, 3.6), size:vec2(3.0,3.0)},
-    ];
-  }
+  // Center panel
+  const panelSize = vec2(720, 300);
+  const panelPos = scr(0.5, 0.5);
+  drawRectGradient(panelPos, panelSize, rgb(0.1,0.12,0.18,0.92), rgb(0.08,0.1,0.14,0.92), 0, false, true, overlayContext);
+  const y = -panelSize.y/2 + 52;
+  drawLineList([
+    panelPos.add(vec2(-panelSize.x/2 + 16, y)),
+    panelPos.add(vec2( panelSize.x/2 - 16, y))
+  ], 2, rgb(1,1,1,0.12), true, vec2(), 0, false, true, overlayContext);
 
-  // Instantiate obstacles
-  for (const o of obstaclesInfo){
-    new Obstacle(o.pos, o.size);
-  }
+  // Header
+  drawTextScreen('A Memory', panelPos.add(vec2(0, -panelSize.y/2 + 28)), 22, rgb(1,1,1,0.96), 0, BLACK, 'center', FONT_CINZEL);
 
-  // Spawn orbs randomly with safety checks
-  const base = memoryLineOffsetForLevel(level);
-  const count = orbsRequiredForLevel(level);
-  for (let i=0; i<count; i++){
-    let p = randomPos();
-    let attempts = 0;
-    while (!isSafe(p, obstaclesInfo) && attempts < 200){
-      p = randomPos();
-      attempts++;
-    }
-    // If still not safe, slightly relax by reducing buffer and try a few more times
-    if (!isSafe(p, obstaclesInfo)){
-      const savedBuffer = obstacleBuffer;
-      // Temporarily reduce checks within this scope
-      const isSafeRelaxed = (q)=>{
-        if (q.distance(vec2(0,0)) < minFromPlayer*0.8) return false;
-        for (const o of obstaclesInfo){
-          const rad = Math.max(o.size.x, o.size.y) * 0.5;
-          if (q.distance(o.pos) < rad + savedBuffer*0.7) return false;
-        }
-        for (const op of orbPositions){
-          if (q.distance(op) < minBetweenOrbs*0.8) return false;
-        }
-        return true;
-      };
-      let tries = 0;
-      while (!isSafeRelaxed(p) && tries < 200){
-        p = randomPos();
-        tries++;
-      }
-    }
-    orbPositions.push(p);
-    memoryOrbs.push(new MemoryOrb(p, base + i));
-  }
-}
-
-// --------- Ending Visuals & Timeline ---------
-function drawEndingSequence(){
-  // Timeline (seconds)
-  // 0-3: slow motion orbit, faint chimes, glow
-  // 3-6: camera zoom out, world fade to white, player glow bloom
-  // 6-8: final line appears phrase by phrase (continues)
-  // 8-10: full white, music fade to warm sustain then silence
-  // 10-12: fade to black
-  // 12-17: epilogue text, then fade to black
-
-  if (!endingTimer) return;
-  const total = 22.0; // extended to include credits card
-  const t = clamp(endingTimer.getPercent(), 0, 1) * total; // time progressed from 0..17
-
-  // Base background: fade to white over time
-  const camSize = getCameraSize();
-  const whiteFade = smoothstep(3.0, 6.0, t); // begin at 3s
-  const whiteAlpha = clamp(whiteFade, 0, 1);
-  drawRect(cameraPos, camSize, rgb(1,1,1,0.0 + 0.0)); // ensure draw order
-
-  // Camera zoom out between 3-6s
-  const zoom = mix(endingCameraScaleStart, endingCameraScaleStart * 1.6, smoothstep(3.0, 6.0, t));
-  cameraScale = zoom;
-  if (player) cameraPos = player.pos; // hard lock center on player during ending
-
-  // Player glow bloom based on t
-  const bloom = smoothstep(3.0, 6.0, t);
-  const glowR1 = 0.28 + 1.2 * bloom;
-  const glowR2 = 0.12 + 0.9 * bloom;
-  // Player-centered bloom during ending
-  drawCircle(player.pos, glowR1, rgb(1,1,1,0.22 + 0.35 * bloom));
-  drawCircle(player.pos, glowR2, rgb(1,1,1,0.85 + 0.1 * bloom));
-
-  // Orbiting orbs around player 0-3s, then they rise and dissolve by 6s
-  const orbRise = smoothstep(0.0, 3.0, t);
-  const dissolve = smoothstep(3.0, 6.0, t);
-  const orbitCenter = player.pos; // keep center locked to player at all times
-  const count = endingOrbs.length;
-  for (let i=0; i<count; i++){
-    const o = endingOrbs[i];
-    const speed = mix(0.6, 1.2, orbRise);
-    o.angle += speed * timeDelta;
-    let r = mix(0.7, 1.1, orbRise) + i * 0.02;
-    r *= 1 + 0.03 * Math.sin(time*0.7 + i*0.6) * (0.3 + 0.7*bloom);
-    const pos = orbitCenter.add(vec2(Math.cos(o.angle), Math.sin(o.angle)).scale(r));
-    const a = (1 - dissolve) * 0.9;
-    drawCircle(pos, 0.25, rgb(0.9,0.97,1, a));
-    drawCircle(pos, 0.5, rgb(0.5,0.8,1, 0.12 * a));
-  }
-
-  // Audio scheduling (reuse existing sfx as musical cues)
-  if (audioArmed){
-    // Faint chimes during 0-3s, about every 0.4s
-    if (t < 3.0 && time > endingNextChimeT){
-      endingNextChimeT = time + 0.4 + rand(-0.08, 0.08);
-      sfx_collect.play(player.pos, 0.2, 1 + rand(-0.05, 0.05));
-    }
-    // Ambient swell hint via pulse every ~0.8s between 0-6s with increasing volume
-    if (t < 6.0 && time > endingNextAmbientT){
-      endingNextAmbientT = time + 0.8 + rand(-0.1, 0.1);
-      const vol = lerp(0.05, 0.18, smoothstep(0.0, 6.0, t));
-      sfx_pulse.play(player.pos, vol, 0.5 + 0.5 * smoothstep(0.0, 6.0, t));
-    }
-    // Warm sustained note at 8s (simulated by a longer pulse)
-    if (t >= 8.0 && !endingSustainPlayed){
-      endingSustainPlayed = true;
-      // Multiple quick pulses to simulate a sustained feel
-      for (let i=0;i<4;i++) setTimeout(()=> sfx_pulse.play(player.pos, 0.15, 0.8), 120*i);
-    }
-  }
-
-  // Draw white overlay as the world fades to light (no special caps during text; rely on adaptive text color)
-  const overlayAlpha = whiteAlpha * 0.95;
-  drawRect(cameraPos, camSize, rgb(1,1,1, overlayAlpha));
-
-  // Final lines word-by-word between 6-8s (phrases appear overlapping)
-  const scr = (x, y) => {
-    const w = overlayCanvas ? overlayCanvas.width : 1280;
-    const h = overlayCanvas ? overlayCanvas.height : 720;
-    return vec2(w * x, h * y);
-  };
-  const textColor = rgb(1,1,1, 0.98 * (1 - clamp(smoothstep(8.0, 10.0, t), 0, 1)) );
-  const lines = [
-    'The small dream…',
-    'opens its eyes…',
-    'and becomes real.'
-  ];
-  // Schedule: overlaps slightly; durations are longer (3s each) with 1.5s in/out
-  const schedule = [6.0, 6.7, 7.4];
+  // Body text
+  const text = tutorial.pages[tutorial.index] || '';
+  const lines = text.split('\n');
+  const baseY = panelPos.y - 18;
   for (let i=0; i<lines.length; i++){
-    const start = schedule[i];
-    const dur = 3.0; // 1.5s fade in + 1.5s fade out
-    const end = start + dur;
-    if (t >= start - 0.2 && t <= end + 0.5){
-      const p = clamp((t - start) / dur, 0, 1);
-      // 1.5s in, 1.5s out
-      const alpha = p < 0.5 ? smoothstep(0.0, 0.5, p) : (1 - smoothstep(0.5, 1.0, p));
-      // Adaptive text color based on background brightness (whiteAlpha):
-      // - As it gets brighter, favor dark near-black text (slightly transparent)
-      // - As it gets darker, fade to white text
-      const b = whiteAlpha; // 0..1 brightness proxy
-      const darkAmt = clamp(b, 0, 1);
-      const lightAmt = 1 - darkAmt;
-      // Dark pass (near-black), subtle outline
-      const y = 0.44 + i*0.08;
-      if (darkAmt > 0.01)
-        drawTextScreen(
-          lines[i], scr(0.5, y), 30,
-          rgb(0.05,0.06,0.08, alpha * darkAmt * 0.95),
-          2, rgb(0,0,0, alpha * darkAmt * 0.25),
-          'center', 'Cinzel, serif'
-        );
-      // Light pass (white)
-      if (lightAmt > 0.01)
-        drawTextScreen(
-          lines[i], scr(0.5, y), 30,
-          rgb(1,1,1, alpha * lightAmt * 0.98),
-          0, BLACK,
-          'center', 'Cinzel, serif'
-        );
-    }
+    drawTextScreen(lines[i], vec2(panelPos.x, baseY + i*28), 20, rgb(0.9,0.95,1,0.92), 0, BLACK, 'center', FONT_UI);
   }
 
-  // At 8-10s, full white and then silence (text window is 6-8s)
-  if (t >= 8.0 && t < 10.0){
-    drawRect(cameraPos, camSize, rgb(1,1,1, 1.0));
-  }
-
-  // 10-12s fade from white to black
-  if (t >= 10.0 && t < 12.0){
-    const a = smoothstep(10.0, 12.0, t);
-    drawRect(cameraPos, camSize, rgb(0,0,0, a));
-  }
-
-  // 12-17s epilogue text on black
-  if (t >= 12.0){
-    drawRect(cameraPos, camSize, rgb(0,0,0,1));
-    const epStart = 12.0;
-    const p = clamp((t - epStart) / 1.5, 0, 1); // fade in over 1.5s
-    // Linger, then fade out between 16-17s
-    const linger = clamp((t - 12.0 - 1.5) / 3.5, 0, 1); // ~5s linger total
-    const fadeOut = smoothstep(16.0, 17.0, t);
-    const a = smoothstep(0, 1, p) * (1 - fadeOut);
-    // Clean, soft text on black (no glow)
-    if (a > 0){
-      const pos = scr(0.5, 0.5);
-      drawTextScreen('“And even the smallest spark remembers.”', pos, 24, rgb(0.98,0.99,1, a), 0, BLACK, 'center', 'Cinzel, serif');
-    }
-  }
-
-  // 17-22s: Credits card on black (title and author)
-  if (t >= 17.0){
-    drawRect(cameraPos, camSize, rgb(0,0,0,1));
-    const fadeIn = smoothstep(17.0, 18.0, t);
-    const titlePos = scr(0.5, 0.46);
-    const byPos    = scr(0.5, 0.56);
-    // Title with micro shadow (clean main text + slight offset shadow)
-    const tpShadow = vec2(titlePos.x, titlePos.y + 2);
-    drawTextScreen('A Small Dream', tpShadow, 42, rgb(0,0,0, fadeIn * 0.22), 0, BLACK, 'center', TITLE_FONT);
-    drawTextScreen('A Small Dream', titlePos, 42, rgb(1,1,1, fadeIn * 0.96), 0, BLACK, 'center', TITLE_FONT);
-    // Author line (Cinzel)
-    const byAlpha = clamp(fadeIn - 0.15, 0, 1);
-    drawTextScreen('by Debmalya Pyne', byPos, 22, rgb(1,1,1, byAlpha * 0.92), 0, BLACK, 'center', 'Cinzel, serif');
-  }
-
-  // End after full timeline
-  if (endingTimer.elapsed()){
-    cameraScale = 28;
-    gameState = STATE_MENU;
-  }
+  // Footer controls
+  const isLast = tutorial.index >= tutorial.pages.length - 1;
+  const hint = isLast ? 'Press Enter / Click to begin' : 'Press Enter / Click to continue';
+  drawTextScreen(hint, panelPos.add(vec2(0, panelSize.y/2 - 28)), 14, rgb(0.86,0.9,1,0.8), 0, BLACK, 'center', FONT_UI);
+  drawTextScreen('Press Esc to skip', panelPos.add(vec2(0, panelSize.y/2 - 54)), 12, rgb(0.86,0.9,1,0.6), 0, BLACK, 'center', FONT_UI);
 }
