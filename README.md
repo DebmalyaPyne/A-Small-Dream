@@ -14,9 +14,16 @@ Made with [LittleJS](https://github.com/KilledByAPixel/LittleJS)
 ## 🕹️ Controls
 
 - Move: Arrow Keys or WASD
-- Continue: Enter / Space / Click
+- Continue (menus, act intro, cutscene): Enter / Space / Click
 - Restart: R
 - Skip cutscene: Enter / Space / Click
+
+## 🧩 Gameplay
+
+- Explore a soft-glow maze; memory orbs are scattered through its corridors.
+- Collect white dream orbs to recall memories and progress through each act.
+- Beware yellow negative dream orbs — they subtract 1 collected orb and reduce your remaining time by 5 seconds.
+- There are three Acts with increasing orb counts, followed by a short ending.
 
 ## 🚀 Run locally
 
@@ -47,7 +54,7 @@ Open <http://localhost:8080> in your browser.
 ## 📜 License
 
 - Code: Apache License 2.0 (Apache-2.0) — see `LICENSE`
-- Original game assets (art/audio/narrative): Creative Commons Attribution 4.0 (CC BY 4.0) — see `ASSETS-LICENSE`
+- Original game assets (narrative): Creative Commons Attribution 4.0 (CC BY 4.0) — see `ASSETS-LICENSE`
 - Third‑party:
   - LittleJS — MIT License
   - Fonts (Cinzel Decorative, Cinzel, Nunito, Fira Code) — SIL Open Font License 1.1 (served via Google Fonts)
